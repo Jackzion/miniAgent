@@ -1,5 +1,9 @@
 import OpenAI from 'openai';
 import type { ChatCompletionMessageParam } from 'openai/resources/chat/completions';
+import { execTool, toOpenAITools } from './tools.js';
+
+/** 工具调用循环的最多轮数，防止模型陷入「调用工具 → 再调用」的死循环。 */
+const MAX_TOOL_TURNS = 5;
 
 /**
  * 对话会话：持有上下文记忆（history），以流式方式请求 OpenAI 兼容接口。
@@ -8,38 +12,94 @@ import type { ChatCompletionMessageParam } from 'openai/resources/chat/completio
 export class Chat {
     private client: OpenAI; // openai client
     private model: string;  // model config name
-    private history: ChatCompletionMessageParam[] = []; // ChatCompletionMessageParam -> [{role:string,input/output:string}]
-
-  constructor(baseURL: string, apiKey: string, model: string) {
-    this.client = new OpenAI({ baseURL, apiKey });
-    this.model = model;
-  }
+    private history: ChatCompletionMessageParam[] = []; // ChatCompletionMessageParam -> [{role:string,content:string}]
+    constructor(baseURL: string, apiKey: string, model: string) {
+        this.client = new OpenAI({ baseURL, apiKey });
+        this.model = model;
+    }
 
     /** 携带 history 发送用户输入，逐段产出回复增量；结束后把完整回答写入 history。 */
     async *streamReply(userInput: string): AsyncGenerator<string> {
         // push userInput to history
         this.history.push({ role: 'user', content: userInput });
         try {
-            // 请求 ， 返回 Stream<OpenAI.Chat.Completions.ChatCompletionChunk>
-            const stream = await this.client.chat.completions.create({
-                model: this.model,
-                messages: this.history, // 每轮全量携带历史
-                stream: true,
-            });
-
-            let answer = '';
-            // for await ChatCompletionChunk , 对每个 chunk 异步等待，完成才 append 到 answer
-            for await (const chunk of stream) {
-                const delta = chunk.choices[0]?.delta?.content ?? '';
-                if (delta) {
-                    // append to answer
-                    answer += delta;
-                    // 对应 asyncGenerator , 调用方能不间断收到 output
-                    yield delta; // 边收边吐
+            // 设置最大调用 tools 次数 ， 避免进入调用 tools 死循环
+            for (let turn = 0; turn < MAX_TOOL_TURNS; turn++) {
+                // 请求 ， 返回 Stream<OpenAI.Chat.Completions.ChatCompletionChunk>
+                const stream = await this.client.chat.completions.create({
+                    model: this.model,
+                    messages: this.history, // 每轮全量携带历史
+                    stream: true,
+                    tools: toOpenAITools(), // 开始请求时，告知本地 tools
+                });
+                // 流式边攒内容边聚拢工具调用（delta 按 index 碎片下发）
+                let answer = '';
+                const calls = new Map<number, { id: string; name: string; args: string }>()
+                // for await ChatCompletionChunk , 对每个 chunk 异步等待，完成才 append 到 answer
+                for await (const chunk of stream) {
+                    const delta = chunk.choices[0]?.delta;
+                    if (delta?.content) {
+                        // append to answer
+                        answer += delta.content;
+                        // 对应 asyncGenerator , 调用方能不间断收到 output
+                        yield delta.content; // 边收边吐
+                    }
+                    // 处理 tool_call , 收集起来聚拢到 calls map 中
+                    //   { role: 'assistant', content: null,
+                    //   tool_calls: [{ id: 'call_0', type: 'function',
+                    //   function: { name: 'get_current_time', arguments: '{}' } }] },
+                    for (const tc of delta?.tool_calls ?? []) {
+                        // calls map 不存在， new 一个
+                        let call = calls.get(tc.index);
+                        if (!call) {
+                            call = { id: '', name: '', args: '' }
+                            calls.set(tc.index, call)
+                        }
+                        // set call value
+                        if (tc.id) call.id = tc.id;
+                        if (tc.function?.name) call.name += tc.function.name;
+                        if (tc.function?.arguments) call.args += tc.function.arguments;
+                    }
                 }
+
+                const toolCalls = [...calls.values()]
+
+                // calls length 大于 0 ， 并且 every c.name 不为空
+                if (toolCalls.length > 0 && toolCalls.every((c) => c.name)) {
+                    // 模型要动手：先把这条 assistant 消息（含 tool_calls）记入 history
+                    toolCalls.forEach((c, i) => {
+                        // 若对不上 id，接口直接 400——这就是要补 id 的原因
+                        if (!c.id) c.id = `call_${i}`
+                    })
+                    // push tool_calls in history
+                    this.history.push({
+                        role: 'assistant',
+                        content: answer || null,
+                        tool_calls: toolCalls.map((c) => ({
+                            id: c.id,
+                            type: 'function' as const,
+                            function: { name: c.name, arguments: c.args },
+                        })),
+                    });
+                    // 逐个执行并把结果以 role=tool 消息回传，然后进入下一轮
+                    for (const c of toolCalls) {
+                        // execTool and get the result
+                        const result = await execTool(c.name, c.args);
+                        // std output result
+                        yield `\n[调用工具 ${c.name} → ${result}]\n`;
+                        // push tool_call result to history
+                        // { role: 'tool', tool_call_id: 'call_0', content: '2026/8/26 15:42:11' },
+                        this.history.push({ role: 'tool', tool_call_id: c.id, content: result });
+                    }
+                    continue;
+                }
+                // push answer to history
+                this.history.push({ role: 'assistant', content: answer });
+                return
             }
-            // push answer to history
-            this.history.push({ role: 'assistant', content: answer });
+            // 轮次用尽仍未停下：兜底收尾，保持 history 有来有回
+            yield '\n[工具调用轮次过多，已停止]';
+            this.history.push({ role: 'assistant', content: '[工具调用轮次过多，已停止]' });
         } catch (err) {
             this.history.pop(); // 出错回滚，保持「有来有回」
             throw err;
