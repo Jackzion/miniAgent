@@ -91,7 +91,7 @@ export class Chat {
                         // { role: 'tool', tool_call_id: 'call_0', content: '2026/8/26 15:42:11' },
                         this.history.push({ role: 'tool', tool_call_id: c.id, content: result });
                     }
-                    continue;
+                    continue;   // 携带 tool_calls  result 重新提问
                 }
                 // push answer to history
                 this.history.push({ role: 'assistant', content: answer });

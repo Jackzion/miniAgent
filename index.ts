@@ -2,11 +2,15 @@ import { createInterface } from "readline";
 import { Chat } from "./chat.js";
 import { loadConfig } from "./config.js";
 import { err, out, paint } from './color.js';
+import { installCliConfirm } from "./tools.js";
 
 const config = loadConfig();
 const chat = new Chat(config.baseURL, config.apiKey, config.model);
 
 const rl = createInterface({ input: process.stdin, output: process.stdout });
+
+installCliConfirm(rl);   // 把主 REPL 的 rl 注入为确认实现
+
 // 用彩色提示符标注「用户输入」这一侧。
 // setPrompt 设置提示符内容（只是设置，还没打印）
 rl.setPrompt(paint('user' , 'YOU >'))
