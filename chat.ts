@@ -43,7 +43,7 @@ export class Chat {
                     yield dropped > 0
                         ? `\n[历史压缩：${dropped} 条旧消息合并为 1 条摘要]\n`
                         : '\n[历史压缩：模型未产出摘要，保留原历史]\n';
-                }catch{
+                } catch {
                     yield '\n[历史压缩失败：保留原历史]\n';
                 }
             }
@@ -183,5 +183,15 @@ export class Chat {
         } catch {
             return '历史压缩失败：保留原历史';
         }
+    }
+
+    // get history
+    exportHistory(): OpenAI.Chat.Completions.ChatCompletionMessageParam[] {
+        return this.history;
+    }
+
+    // set hitstory
+    importHistory(messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[]): void {
+        this.history = messages;
     }
 }

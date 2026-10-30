@@ -53,3 +53,6 @@ temp/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# ===== 本地会话存档 =====
+.geekagent/
