@@ -8,6 +8,7 @@
     "start": "tsx index.ts"
   },
   "dependencies": {
+    "@earendil-works/pi-tui": "0.84.4",
     "dotenv": "^17.4.2",
     "openai": "^7.5.0"
   },

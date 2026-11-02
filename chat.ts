@@ -26,9 +26,17 @@ export class Chat {
     private client: OpenAI; // openai client
     private model: string;  // model config name
     private history: ChatCompletionMessageParam[] = []; // ChatCompletionMessageParam -> [{role:string,content:string}]
+
+    /** 每次请求拿到用量就回调出去，供 TUI 面板累计显示。 */
+    private onUsage?: (u: UsageInfo) => void;
+
     constructor(baseURL: string, apiKey: string, model: string) {
         this.client = new OpenAI({ baseURL, apiKey });
         this.model = model;
+    }
+
+    setUsageListener(fn: (u: UsageInfo) => void): void {
+        this.onUsage = fn;
     }
 
     /** 携带 history 发送用户输入，逐段产出回复增量；结束后把完整回答写入 history。 */
@@ -56,6 +64,7 @@ export class Chat {
                     messages: this.history, // 每轮全量携带历史
                     stream: true,
                     tools: toOpenAITools(), // 开始请求时，告知本地 tools
+                    stream_options: { include_usage: true } // 返回增加 usage
                 });
                 // 流式边攒内容边聚拢工具调用（delta 按 index 碎片下发）
                 let answer = '';
@@ -85,6 +94,8 @@ export class Chat {
                         if (tc.function?.name) call.name += tc.function.name;
                         if (tc.function?.arguments) call.args += tc.function.arguments;
                     }
+                    // 只有最后一个 chunk 才带 usage
+                    if (chunk.usage) this.reportUsage(chunk.usage);
                 }
 
                 const toolCalls = [...calls.values()]
@@ -131,6 +142,16 @@ export class Chat {
         }
     }
 
+    /** 把接口返回的 usage 归一化成 UsageInfo，回调给外部累计。 */
+    private reportUsage(usage: OpenAI.CompletionUsage | null | undefined): void {
+        if (!usage) return;
+        this.onUsage?.({
+            prompt: usage.prompt_tokens, // 输入 消耗的 token——本轮发给模型的全部内容
+            completion: usage.completion_tokens, // 输出 消耗的 token——模型生成的回复内容
+            total: usage.total_tokens, // 总用量，≈`prompt + completion`
+        });
+    }
+
     // reset history
     reset(): void {
         this.history = []
@@ -160,6 +181,8 @@ export class Chat {
                 { role: 'user', content: JSON.stringify(old, null, 2) },
             ]
         })
+        // 历史压缩的非流式请求同样回传 usage
+        this.reportUsage(res.usage)
         const text = res.choices[0]?.message?.content?.trim()
         if (!text) return 0
         // put summary in history
@@ -194,4 +217,11 @@ export class Chat {
     importHistory(messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[]): void {
         this.history = messages;
     }
+}
+
+/** 单次请求的用量信息（同 OpenAI 的 usage 字段）。 */
+export interface UsageInfo {
+    prompt: number;
+    completion: number;
+    total: number;
 }
