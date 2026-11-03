@@ -6,6 +6,8 @@ import { ReadLine } from "node:readline";
 import { out } from "./color.js";
 import { readdir, readFile, glob, mkdir, writeFile } from 'node:fs/promises';
 import { dirname } from "node:path";
+import { authorize, policyFor } from "./permissions.js";
+import { backup } from "./undo.js";
 
 const execAsync = promisify(exec);
 
@@ -55,6 +57,8 @@ export interface Tool {
     // `Record<K,V>`：TS 工具类型，描述普通对象
     parameters: Record<string, unknown>
     run(args: Record<string, unknown>): Promise<string> | string
+    /** 工具内部需要先构造 diff 等详细提示时，自行调用 authorize。 */
+    authorizes?: boolean;
 }
 
 /** 全部已接入工具。模型只会拿到这份清单里声明的函数。 */
@@ -79,7 +83,7 @@ export const BUILTIN_TOOLS: Tool[] = [
             const command = String(args.command ?? '').trim();
             if (!command) return '缺少参数 command';
 
-            if (!(await confirm(`即将执行命令：${command}`))) {
+            if (!(await authorize('run_shell',`即将执行命令：${command}`))) {
                 return '已取消执行';
             }
 
@@ -98,6 +102,7 @@ export const BUILTIN_TOOLS: Tool[] = [
                 return truncate(`命令执行失败（${e.message}）\n${partial}`);
             }
         },
+        authorizes: true,
     },
     {
         name: 'ls',
@@ -196,9 +201,10 @@ export const BUILTIN_TOOLS: Tool[] = [
         run: async (args) => {
             const file = String(args.path ?? '').trim();
             if (!file) return '缺少参数 path';
-            const wrote = await commitWrite(file, String(args.content ?? ''));
+            const wrote = await commitWrite('write', file, String(args.content ?? ''));
             return wrote ? `已写入 ${file}` : '已取消写入';
         },
+        authorizes: true,
     },
     {
         name: 'patch',
@@ -246,16 +252,17 @@ export const BUILTIN_TOOLS: Tool[] = [
                 patched = patched.slice(0, i) + h.new + patched.slice(i + h.old.length);
             }
             if (patched === original) return '替换后内容与原文件一致，未做任何修改';
-            const wrote = await commitWrite(file, patched);
+            const wrote = await commitWrite('patch', file, patched);
             return wrote ? `已应用 ${hunks.length} 处修改到 ${file}` : '已取消修改';
         },
+        authorizes: true,
     },
 ];
 
 BUILTIN_TOOLS.forEach(registerTool);
 
 /** 展示 diff 并确认后写盘；新文件也照常走此流程。内容没变则不打扰用户，直接返回成功。 */
-async function commitWrite(file: string, next: string): Promise<boolean> {
+async function commitWrite(tool: 'write' | 'patch', file: string, next: string): Promise<boolean> {
     let oldtxt = ''
     try {
         oldtxt = await readFile(file, 'utf-8')
@@ -264,10 +271,12 @@ async function commitWrite(file: string, next: string): Promise<boolean> {
     }
     if (oldtxt === next) return true
     // 修改文件前先 confirm
-    if (!(await confirm(`\n${simpleDiff(oldtxt, next)}\n确认写入 ${file}？`))) return false;
+    if (!(await authorize(tool, `\n${simpleDiff(oldtxt, next)}\n确认写入 ${file}？`))) return false;
+    // 先 backup 
+    await backup(file, oldtxt);
     // 确认文件是否存在，不存在新建一个
     await mkdir(dirname(file), { recursive: true })
-    await writeFile(file,next)
+    await writeFile(file, next)
     return true
 }
 
@@ -306,39 +315,6 @@ function truncate(text: string): string {
     return `${text.slice(0, MAX_OUTPUT_CHARS)}\n...(输出已截断，原共 ${text.length} 字符)`;
 }
 
-type ConfirmFn = (prompt: string) => Promise<boolean>;
-
-let confirm: ConfirmFn = async () => false;   // 未注入时一律拒绝，命令不会在无人确认下执行
-
-/** 注入交互式确认逻辑（后续权限模型可在此替换）。 */
-export function setConfirmFn(fn: ConfirmFn): void {
-    confirm = fn;
-}
-
-// 基于「唯一的那一个」readline 接口构造 CLI 确认：临时挂一个 line 监听器读一次回答，
-// 读完即移除，主 rl 始终不 close。默认 CLI 实现，属于 tools 内部细节，不单独导出。
-function buildCliConfirm(rl: ReadLine): ConfirmFn {
-    return (prompt) =>
-        // promise define
-        new Promise<boolean>((resolve) => {
-            const onLine = (raw: string) => {
-                rl.removeListener('line', onLine);
-                const ans = raw.trim().toLowerCase();
-                // complete the promise and return the value
-                resolve(ans === 'y' || ans === 'yes');
-            };
-            // 临时挂一个 line 监听器读一次回答
-            rl.on('line', onLine);
-            rl.resume();
-            out('tool', `${prompt} [y/N] `);   // 确认提示染黄色，一眼认出是危险操作
-        });
-}
-
-/** 用主 REPL 的 readline 接口安装 CLI 确认（index.ts 调用这一行即可）。 */
-export function installCliConfirm(rl: ReadLine): void {
-    setConfirmFn(buildCliConfirm(rl));
-}
-
 /** 把内部 Tool 转成 OpenAI Chat Completions 的 tools 参数格式。 */
 export function toOpenAITools(): ChatCompletionTool[] {
     return registry.map((tool) => ({
@@ -367,6 +343,11 @@ export async function execTool(name: string, argsJson: string): Promise<string> 
 
     // 执行 tool.run(args) return string to llm
     try {
+        // 执行前先请求 permission 
+        if (policyFor(name) === 'deny') return `权限拒绝：工具 ${name} 不允许执行`;
+        // 询问是否能被使用 
+        if (!tool.authorizes && !(await authorize(name))) return `权限拒绝：工具 ${name} 不允许执行`;
+        // exec tool func
         return await tool.run(args);
     } catch (err) {
         return `工具执行失败：${(err as Error).message}`;

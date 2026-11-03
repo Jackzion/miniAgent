@@ -2,13 +2,18 @@
 import 'dotenv/config';
 import { loadConfig } from './config.js';
 import { Chat } from './chat.js';
-import { setConfirmFn } from './tools.js';
 import { loadSessions, saveSessions } from './storage.js';
 import { TUI, estimateTokens } from './tui.js';
 import { Sessions } from './session.js';
+import { loadPermissions, permissionRoot, setupPermissions } from './permissions.js';
+import { visibleWidth } from '@earendil-works/pi-tui';
+import { basename } from 'path';
+import { undo } from './undo.js';
 
 /** 模型上下文窗口（tokens）：demo 直接写死，用于计算「上下文占用比例」。 */
 const CONTEXT_WINDOW = 64000;
+/** 面板内容宽 26 列；「根目录  」占 8 列，剩余 18 列优先留给最后一级目录。 */
+const ROOT_DISPLAY_WIDTH = 18;
 
 if (!process.stdin.isTTY || !process.stdout.isTTY) {
     console.error('Day 7 的 TUI 需要真实终端（TTY）；管道 / 重定向下请运行 day6。');
@@ -16,6 +21,16 @@ if (!process.stdin.isTTY || !process.stdout.isTTY) {
 }
 
 const config = loadConfig();
+
+// 加载权限
+let permissions;
+try {
+    permissions = await loadPermissions();
+} catch (e) {
+    console.error(`.geekagent/GeekAgent.json 读取失败：${(e as Error).message}`);
+    process.exit(1);
+}
+
 const chat = new Chat(config.baseURL, config.apiKey, config.model);
 const sessions = new Sessions();
 
@@ -25,8 +40,11 @@ const usage = { cum: 0, round: 0, live: 0 };
 let busy = false;
 
 const tui = new TUI(onLine, onExit);
-// 把工具层的执行确认接到 TUI：默认实现是「一律拒绝」，这里换成输入行上的 [y/N]
-setConfirmFn((prompt) => tui.confirm(prompt));
+
+// 把权限层 ask 的确认接到 TUI: 默认实现是「一律拒绝」，这里换成输入行上的 [y/N]
+setupPermissions(permissions, (prompt) => tui.confirm(prompt));
+
+
 chat.setUsageListener((u) => {
     usage.live = 0; // 真实用量到了，清掉流式估算，避免短暂重复计数
     usage.cum += u.total;
@@ -38,6 +56,9 @@ chat.setUsageListener((u) => {
 function buildPanel(): string[] {
     const window = CONTEXT_WINDOW;
     const ctx = estimateTokens(JSON.stringify(chat.exportHistory()));
+    // 追加当前 workplace 目录显示 
+    const root = permissionRoot();
+    const shownRoot = visibleWidth(root) <= ROOT_DISPLAY_WIDTH ? root : `…/${basename(root)}`;
     return [
         `模型  ${config.model}`,
         `会话  ${sessions.currentId()}`,
@@ -142,6 +163,13 @@ async function handleCommand(line: string): Promise<void> {
             break;
         case '/exit':
             await onExit();
+            break;
+        case '/undo':
+            try {
+                tui.append(`（${await undo()}）`, 'sys');
+            } catch (e) {
+                tui.append(`撤销失败：${(e as Error).message}`, 'sys');
+            }
             break;
         default:
             tui.append(`未知命令：${command}（输入 /help 查看）`, 'sys');
