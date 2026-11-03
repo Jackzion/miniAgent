@@ -1,153 +1,209 @@
-import { createInterface } from "readline";
-import { Chat } from "./chat.js";
-import { loadConfig } from "./config.js";
-import { err, out, paint } from './color.js';
-import { installCliConfirm } from "./tools.js";
-import { Sessions } from "./session.js";
-import { loadSessions, saveSessions } from "./storage.js";
+// day7/index.ts
+import 'dotenv/config';
+import { loadConfig } from './config.js';
+import { Chat } from './chat.js';
+import { setConfirmFn } from './tools.js';
+import { loadSessions, saveSessions } from './storage.js';
+import { TUI, estimateTokens } from './tui.js';
+import { Sessions } from './session.js';
+
+/** 模型上下文窗口（tokens）：demo 直接写死，用于计算「上下文占用比例」。 */
+const CONTEXT_WINDOW = 64000;
+
+if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    console.error('Day 7 的 TUI 需要真实终端（TTY）；管道 / 重定向下请运行 day6。');
+    process.exit(1);
+}
 
 const config = loadConfig();
 const chat = new Chat(config.baseURL, config.apiKey, config.model);
 const sessions = new Sessions();
 
-const rl = createInterface({ input: process.stdin, output: process.stdout });
-
-installCliConfirm(rl);   // 把主 REPL 的 rl 注入为确认实现
-
-// 用彩色提示符标注「用户输入」这一侧。
-// setPrompt 设置提示符内容（只是设置，还没打印）
-rl.setPrompt(paint('user', 'YOU >'))
-
+/** 用量状态：live 是流式进行中按字符估算的增量；正式总数以接口 usage 为准。 */
+const usage = { cum: 0, round: 0, live: 0 };
+/** 忙碌期间 TUI 不接受新输入，这里再兜一层防止异步入队重入。 */
 let busy = false;
 
+const tui = new TUI(onLine, onExit);
+// 把工具层的执行确认接到 TUI：默认实现是「一律拒绝」，这里换成输入行上的 [y/N]
+setConfirmFn((prompt) => tui.confirm(prompt));
+chat.setUsageListener((u) => {
+    usage.live = 0; // 真实用量到了，清掉流式估算，避免短暂重复计数
+    usage.cum += u.total;
+    usage.round += u.total;
+    updatePanel();
+});
+
+/** 右侧面板：模型、会话、上下文占用与本轮 / 累计 tokens。 */
+function buildPanel(): string[] {
+    const window = CONTEXT_WINDOW;
+    const ctx = estimateTokens(JSON.stringify(chat.exportHistory()));
+    return [
+        `模型  ${config.model}`,
+        `会话  ${sessions.currentId()}`,
+        '──── 上下文 ────',
+        `${ctx} / ${window} tokens`,
+        `${Math.ceil((ctx / window) * 100)}% used`,
+        '──── 本轮 ────',
+        `${usage.round + usage.live} tokens`,
+        '──── 累计 ────',
+        `${usage.cum} tokens`,
+    ];
+}
+
+function updatePanel(): void {
+    tui.setPanel(buildPanel());
+}
+
 function printHelp(): void {
-    out('sys', `可用命令：
-  /help   显示帮助
-  /reset  清空本轮对话记忆
-  /exit   退出（等价于 Ctrl+C / Ctrl+D）
+    tui.append(`可用命令：
+  /help    显示帮助
   /compact 立即压缩旧对话摘要（不等自动触发）
-    已接入工具：get_current_time（当前时间）、run_shell（执行 shell 命令，执行前需确认）、ls（列目录）、read（读文件）、glob（通配符查文件）——三者只读、免确认；write（写文件）、patch（按片段精确修改）——后两者写入前会展示 diff 并确认。模型需要时会自动调用。
-    历史保护：history 累积过久时自动压缩——让模型把旧对话摘要成一条「此前对话摘要」，保留最近几条消息原样，腾出上下文（压缩进度以黄色行提示）。
-    输入任意内容即可与模型对话。`, true);
+  /save    保存全部会话到 .geekagent/sessions.json
+  /load    从 .geekagent/sessions.json 恢复全部会话
+  /new <id> 新建并切换到会话
+  /open <id> 切换会话
+  /sessions 列出内存中的会话
+  /reset   清空当前会话记忆
+  /exit    保存全部会话并退出（等价于 Ctrl+C / Ctrl+D）
+已接入工具：get_current_time（当前时间）、run_shell（执行 shell，需确认）、ls / read / glob（只读、免确认）、write / patch（写入前展示 diff 并确认）。
+右侧面板实时显示本轮 / 累计 tokens 与上下文占用比例：消耗看得见，挤爆之前就知道该压缩了。`, 'sys');
 }
 
 async function saveAll(): Promise<{ count: number; file: string }> {
-    const data = sessions.dump(chat.exportHistory())
-    const file = await saveSessions(data)
-    return { count: Object.keys(data.sessions).length, file }
+    const data = sessions.dump(chat.exportHistory());
+    const file = await saveSessions(data);
+    return { count: Object.keys(data.sessions).length, file };
 }
 
-// listen userInput
-// 用户按回车 → 拿到一整行 → 喂给 chat.streamReply
-rl.on('line', async (raw) => {
-    if (busy) return; // 上一轮还在流式输出，忽略连发输入
-    busy = true;
-
-    // 解析 userinput 
-    const line = raw.trim();
-    if (line) {
-        if (line.startsWith('/')) {
-            const [command, id] = line.split(/\s+/, 2);
-            switch (command) {
-                case '/help':
-                    printHelp();
-                    break;
-                case '/reset':
-                    chat.reset();
-                    out('sys', '（已清空对话记忆）', true);
-                    break;
-                case '/exit':
-                    rl.close();
-                    return;
-                // 压缩上下文 history - 主动
-                case '/compact':
-                    out('sys', '\n');
-                    out('tool', `[${await chat.compact()}]`, true);
-                    break;
-                case '/save':
-                    try {
-                        const { count, file } = await saveAll();
-                        out('sys', `（已保存 ${count} 个会话到 ${file}）`, true);
-                    } catch (e) {
-                        err('sys', `保存失败：${(e as Error).message}`);
-                    }
-                    break;
-                case '/load':
-                    try {
-                        const { data, file } = await loadSessions();
-                        const messages = sessions.restore(data);
-                        chat.importHistory(messages);
-                        out('sys', `（已从 ${file} 恢复 ${sessions.list(messages).length} 个会话，当前：${sessions.currentId()}）`, true);
-                    } catch (e) {
-                        err('sys', `读取失败：${(e as Error).message}`);
-                    }
-                    break;
-                case '/new':
-                    if (!id) {
-                        err('sys', '用法：/new <id>');
-                        break;
-                    }
-                    try {
-                        chat.importHistory(sessions.create(id, chat.exportHistory()));
-                        out('sys', `（已新建并切换到会话 ${id}）`, true);
-                    } catch (e) {
-                        err('sys', `新建失败：${(e as Error).message}`);
-                    }
-                    break;
-                case '/sessions': {
-                    const list = sessions.list(chat.exportHistory());
-                    const lines = list.map((item) => `${item.current ? '*' : ' '} ${item.id}（${item.count} 条消息）`);
-                    out('sys', `会话：\n${lines.join('\n')}`, true);
-                    break;
-                }
-                case '/open':
-                    if (!id) {
-                        err('sys', '用法：/open <id>');
-                        break;
-                    }
-                    try {
-                        const messages = sessions.open(id, chat.exportHistory());
-                        chat.importHistory(messages);
-                        out('sys', `（已切换到会话 ${id}，${messages.length} 条消息）`, true);
-                    } catch (e) {
-                        err('sys', `打开失败：${(e as Error).message}`);
-                    }
-                    break;
-                case '/exit':
-                    rl.close();
-                    return;
-                default:
-                    out('sys', `未知命令：${line}（输入 /help 查看）`, true);
-            }
-        } else {
+// handle / command
+async function handleCommand(line: string): Promise<void> {
+    const [command, id] = line.split(/\s+/, 2);
+    switch (command) {
+        case '/help':
+            printHelp();
+            break;
+        case '/reset':
+            chat.reset();
+            tui.append('（已清空对话记忆）', 'sys');
+            break;
+        case '/compact':
+            tui.append(`[${await chat.compact()}]`, 'tool');
+            break;
+        case '/save':
             try {
-                out('sys', '\n'); // 模型回复另起一行
-                // 获得 chat res stream -> asyncGenerator —> 流式输出
-                for await (const delta of chat.streamReply(line)) {
-                    // 调用工具 ， 历史压缩用其他颜色显示
-                    const isProgress = delta.startsWith('\n[调用工具') || delta.startsWith('\n[历史压缩');
-                    out(isProgress ? 'tool' : 'model', delta);
-                }
-                out('sys', '\n');
+                const { count, file } = await saveAll();
+                tui.append(`（已保存 ${count} 个会话到 ${file}）`, 'sys');
             } catch (e) {
-                err('sys', `\n请求失败：${(e as Error).message}`);
+                tui.append(`保存失败：${(e as Error).message}`, 'sys');
             }
+            break;
+        case '/load':
+            try {
+                const { data, file } = await loadSessions();
+                const messages = sessions.restore(data);
+                chat.importHistory(messages);
+                tui.append(`（已从 ${file} 恢复 ${sessions.list(messages).length} 个会话，当前：${sessions.currentId()}）`, 'sys');
+            } catch (e) {
+                tui.append(`读取失败：${(e as Error).message}`, 'sys');
+            }
+            break;
+        case '/new':
+            if (!id) {
+                tui.append('用法：/new <id>', 'sys');
+                break;
+            }
+            try {
+                chat.importHistory(sessions.create(id, chat.exportHistory()));
+                tui.append(`（已新建并切换到会话 ${id}）`, 'sys');
+            } catch (e) {
+                tui.append(`新建失败：${(e as Error).message}`, 'sys');
+            }
+            break;
+        case '/sessions': {
+            const lines = sessions
+                .list(chat.exportHistory())
+                .map((item) => `${item.current ? '*' : ' '} ${item.id}（${item.count} 条消息）`);
+            tui.append(`会话：\n${lines.join('\n')}`, 'sys');
+            break;
         }
+        case '/open':
+            if (!id) {
+                tui.append('用法：/open <id>', 'sys');
+                break;
+            }
+            try {
+                const messages = sessions.open(id, chat.exportHistory());
+                chat.importHistory(messages);
+                tui.append(`（已切换到会话 ${id}，${messages.length} 条消息）`, 'sys');
+            } catch (e) {
+                tui.append(`打开失败：${(e as Error).message}`, 'sys');
+            }
+            break;
+        case '/exit':
+            await onExit();
+            break;
+        default:
+            tui.append(`未知命令：${command}（输入 /help 查看）`, 'sys');
     }
+    updatePanel();
+}
 
+// request llm and handle reply with llm output
+async function reply(line: string): Promise<void> {
+    usage.round = 0;
+    try {
+        tui.append('', 'sys'); // 回复前空一行，把上一段对话隔开
+        // for await delta of async Generator 流式输出监听
+        for await (const delta of chat.streamReply(line)) {
+            // 进度行（工具调用 / 历史压缩）用黄色；流式期间按字符估算本轮增量
+            if (delta.startsWith('\n[调用工具') || delta.startsWith('\n[历史压缩')) {
+                usage.live = 0;
+                tui.append(delta, 'tool');
+            } else {
+                // 正常 reply color model
+                tui.appendInline(delta, 'model');
+                usage.live = estimateTokens(delta);
+            }
+            updatePanel();
+        }
+        usage.live = 0;
+        tui.append('', 'sys');
+    } catch (e) {
+        tui.append(`请求失败：${(e as Error).message}`, 'sys');
+    }
+    updatePanel();
+}
+
+async function onLine(line: string): Promise<void> {
+    if (busy) return; // TUI 已挡一道，这里再兜一次防止重入
+    busy = true;
+    tui.setBusy(true);
+    if (line.startsWith('/')) {
+        await handleCommand(line);
+    } else {
+        await reply(line);
+    }
     busy = false;
-    // 弹出用户提示 
-    rl.prompt();
-});
+    tui.setBusy(false);
+    tui.ready(); // 恢复到输入状态，读下一行
+}
 
-// 监听 stdout 事件
-rl.on('close', () => {
-    // output bye
-    out('sys', 'bye', true);
-    saveAll()
+async function onExit(): Promise<void> {
+    tui.stop(); // 恢复原来的终端内容后再用 console 打印
+    try {
+        const generatedId = sessions.nameDefault(chat.exportHistory());
+        const { count, file } = await saveAll();
+        console.log(`（退出前已保存 ${count} 个会话到 ${file}）`);
+        if (generatedId) console.log(`（会话 ID：${generatedId}，重启后可用 /load 再用 /open ${generatedId} 打开）`);
+    } catch (e) {
+        console.error(`退出前保存失败：${(e as Error).message}`);
+    }
+    console.log('bye');
     process.exit(0);
-});
+}
 
-// start with chat
-out('sys', `GeekAgent Day 1 —— 最简单的 Agent（模型：${config.model}，输入 /help 查看命令）`, true);
-rl.prompt();
+tui.start();
+updatePanel();
+tui.append('miniAgent —— 轻量 TUI + 用量显示', 'sys');
+tui.append('输入 /help 查看命令；右侧面板实时显示用量。', 'sys');
