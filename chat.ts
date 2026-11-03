@@ -3,6 +3,7 @@ import type { ChatCompletionMessageParam } from 'openai/resources/chat/completio
 import { execTool, toOpenAITools } from './tools.js';
 import { promises } from 'node:dns';
 import { out } from './color.js';
+import { Agent } from 'node:http';
 
 /** 工具调用循环的最多轮数，防止模型陷入「调用工具 → 再调用」的死循环。 */
 const MAX_TOOL_TURNS = 5;
@@ -17,6 +18,10 @@ const COMPRESS_SYSTEM = `你是对话压缩器。把用户贴出的历史对话�
 - 出现过的文件路径、shell 命令、工具调用与关键结论；
 - 尚未完成、仍在推进中的事项。
 只输出压缩后的要点，不要解释、不要寒暄、不要保留逐字对话。`;
+
+/** agent prompt */
+const AGENT_SYSTEM = `你是一个本地编码 Agent。遇到需要多个步骤的任务时，先调用 todo_write 制定简短计划，再逐项执行并更新状态；用户明确要求 TODO 或任务清单时，必须先调用 todo_write。简单任务直接完成，不要为了形式创建 TODO。可把边界清楚的分析、设计或审查任务交给 delegate_task，多个子任务必须串行委派。`;
+
 
 /**
  * 对话会话：持有上下文记忆（history），以流式方式请求 OpenAI 兼容接口。
@@ -43,6 +48,10 @@ export class Chat {
     async *streamReply(userInput: string): AsyncGenerator<string> {
         // push userInput to history
         this.history.push({ role: 'user', content: userInput });
+        // RegExp 截取是否有 todo 关键字
+        const wantsTodo = /todo|任务清单|然后|最后|再.{0,12}(?:给出|总结|汇总)|并(?:给出|总结|汇总)/i.test(userInput);
+        let mustUpdateTodo = false;
+
         try {
             // history 超长时，先压缩
             if (this.historySize() > MAX_HISTORY_CHARS) {
@@ -58,12 +67,17 @@ export class Chat {
 
             // 设置最大调用 tools 次数 ， 避免进入调用 tools 死循环
             for (let turn = 0; turn < MAX_TOOL_TURNS; turn++) {
+                // forceTodo = true 强制让 llm 调用 todo_write 方法 ，更新 todo_items and ui
+                const forceTodo = (turn === 0 && wantsTodo) || mustUpdateTodo;
+                mustUpdateTodo = false;
                 // 请求 ， 返回 Stream<OpenAI.Chat.Completions.ChatCompletionChunk>
                 const stream = await this.client.chat.completions.create({
                     model: this.model,
-                    messages: this.history, // 每轮全量携带历史
+                    messages: [{ role: 'system', content: AGENT_SYSTEM }, ...this.history], // 每轮全量携带历史
                     stream: true,
                     tools: toOpenAITools(), // 开始请求时，告知本地 tools
+                    // 若有 todo keyword 直接强制 apeend todo_write in tool_choice
+                    tool_choice: forceTodo ? { type: 'function', function: { name: 'todo_write' } } : 'auto',
                     stream_options: { include_usage: true } // 返回增加 usage
                 });
                 // 流式边攒内容边聚拢工具调用（delta 按 index 碎片下发）
@@ -127,6 +141,8 @@ export class Chat {
                         // { role: 'tool', tool_call_id: 'call_0', content: '2026/8/26 15:42:11' },
                         this.history.push({ role: 'tool', tool_call_id: c.id, content: result });
                     }
+                    // 更新 todo write ui
+                    mustUpdateTodo = toolCalls.some((c) => c.name === 'delegate_task');
                     continue;   // 携带 tool_calls  result 重新提问
                 }
                 // push answer to history
@@ -206,6 +222,19 @@ export class Chat {
         } catch {
             return '历史压缩失败：保留原历史';
         }
+    }
+
+    /** 子 Agent 使用独立上下文完成一个聚焦任务，结果回到主 Agent 后再继续 pipeline。 */
+    async delegate(task: string): Promise<string> {
+        const res = await this.client.chat.completions.create({
+            model: this.model,
+            messages: [
+                { role: 'system', content: '你是子 Agent。只完成给定子任务，返回简洁、可直接交给主 Agent 使用的结果；不要寒暄。' },
+                { role: 'user', content: task },
+            ],
+        })
+        this.reportUsage(res.usage);
+        return res.choices[0]?.message?.content?.trim() || '子Agent未返回结果'
     }
 
     // get history

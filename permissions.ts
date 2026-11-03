@@ -19,6 +19,8 @@ const DEFAULT_TOOLS: Record<string, Policy> = {
     glob: 'allow',
     write: 'ask',
     patch: 'ask',
+    todo_write: 'allow',
+    delegate_task: 'allow',
 };
 
 // default PermissionConfig

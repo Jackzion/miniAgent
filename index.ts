@@ -7,8 +7,9 @@ import { TUI, estimateTokens } from './tui.js';
 import { Sessions } from './session.js';
 import { loadPermissions, permissionRoot, setupPermissions } from './permissions.js';
 import { visibleWidth } from '@earendil-works/pi-tui';
-import { basename } from 'path';
+import { basename, format } from 'path';
 import { undo } from './undo.js';
+import { formatTodos, setupPlanning } from './todo.js';
 
 /** 模型上下文窗口（tokens）：demo 直接写死，用于计算「上下文占用比例」。 */
 const CONTEXT_WINDOW = 64000;
@@ -41,6 +42,8 @@ let busy = false;
 
 const tui = new TUI(onLine, onExit);
 
+// delegate_task 接到 Chat.delegate
+setupPlanning((task) => chat.delegate(task), updatePanel);
 // 把权限层 ask 的确认接到 TUI: 默认实现是「一律拒绝」，这里换成输入行上的 [y/N]
 setupPermissions(permissions, (prompt) => tui.confirm(prompt));
 
@@ -59,6 +62,9 @@ function buildPanel(): string[] {
     // 追加当前 workplace 目录显示 
     const root = permissionRoot();
     const shownRoot = visibleWidth(root) <= ROOT_DISPLAY_WIDTH ? root : `…/${basename(root)}`;
+    // 追加 todo write 显示
+    const todos = formatTodos()
+
     return [
         `模型  ${config.model}`,
         `会话  ${sessions.currentId()}`,
@@ -69,6 +75,8 @@ function buildPanel(): string[] {
         `${usage.round + usage.live} tokens`,
         '──── 累计 ────',
         `${usage.cum} tokens`,
+        '──── TODO ────',
+        ...(todos.length > 0 ? todos : ['（暂无任务）']),
     ];
 }
 
@@ -171,6 +179,11 @@ async function handleCommand(line: string): Promise<void> {
                 tui.append(`撤销失败：${(e as Error).message}`, 'sys');
             }
             break;
+        case '/todos': {
+            const todos = formatTodos();
+            tui.append(todos.length > 0 ? `TODO：\n${todos.join('\n')}` : '（暂无 TODO）', 'sys');
+            break;
+        }
         default:
             tui.append(`未知命令：${command}（输入 /help 查看）`, 'sys');
     }
