@@ -12,6 +12,7 @@ import { undo } from './undo.js';
 import { formatTodos, setupPlanning } from './todo.js';
 import { listMemory, loadMemory, setupMemory } from './memory.js';
 import { loadIntroduction } from './instructions.js';
+import { activateSkill, activeSkill, deactivateSkill, describeActiveSkill, listSkills, loadSkills } from './skill.js';
 
 /** 模型上下文窗口（tokens）：demo 直接写死，用于计算「上下文占用比例」。 */
 const CONTEXT_WINDOW = 64000;
@@ -46,6 +47,8 @@ try {
 
 const chat = new Chat(config.baseURL, config.apiKey, config.model, introduction);
 const sessions = new Sessions();
+// 加载 skills
+const skills = await loadSkills();
 
 /** 用量状态：live 是流式进行中按字符估算的增量；正式总数以接口 usage 为准。 */
 const usage = { cum: 0, round: 0, live: 0 };
@@ -91,6 +94,8 @@ function buildPanel(): string[] {
         `${usage.cum} tokens`,
         '──── TODO ────',
         ...(todos.length > 0 ? todos : ['（暂无任务）']),
+        '──── 技能 ────',
+        `技能  ${activeSkill()?.name ?? '无'}`,
     ];
 }
 
@@ -203,6 +208,30 @@ async function handleCommand(line: string): Promise<void> {
             tui.append(memory.length > 0 ? `记忆：\n${memory.join('\n')}` : '（暂无记忆）', 'sys');
             break;
         }
+        case '/skills': {
+            const lines = listSkills().filter((s) => s.name).map((s) => `${activeSkill()?.name === s.name ? '*' : ' '} ${s.name} — ${s.description}`);
+            tui.append(lines.length > 0 ? `可用技能（skills/ 目录，/use 加载）：\n${lines.join('\n')}` : '（skills/ 目录下暂无技能）', 'sys');
+            break;
+        }
+        case '/use':
+            if (!id) {
+                tui.append('用法：/use <技能名>（/skills 查看可用技能）', 'sys');
+                break;
+            }
+            try {
+                activateSkill(id);
+                chat.setSkillInstructions(activeSkill()?.instructions ?? '');
+                tui.append(`已加载技能 ${describeActiveSkill()}`, 'tool');
+            } catch (e) {
+                tui.append(`加载失败：${(e as Error).message}`, 'sys');
+            }
+            break;
+        case '/unuse':
+            deactivateSkill();
+            chat.setSkillInstructions('');
+            tui.append('（已卸载技能，恢复默认行为）', 'tool');
+            break;
+
         default:
             tui.append(`未知命令：${command}（输入 /help 查看）`, 'sys');
     }
@@ -267,3 +296,6 @@ tui.start();
 updatePanel();
 tui.append('miniAgent —— 轻量 TUI + 用量显示', 'sys');
 tui.append('输入 /help 查看命令；右侧面板实时显示用量。', 'sys');
+
+tui.append(' —— 技能系统', 'sys');
+const skillNames = skills.map((s) => s.name).join('、') || '（暂无）';

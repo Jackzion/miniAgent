@@ -31,12 +31,33 @@ interface PatchHunk {
 }
 
 /**
- * 显式调用 registerTool
+ * 显式调用 registerTool 注册工具
  * @param tool 
  */
 export function registerTool(tool: Tool): void {
     if (registry.some((t) => t.name === tool.name)) throw new Error(`工具 ${tool.name} 已注册`);
     registry.push(tool);
+}
+
+/**
+ * 显式调用 unregisterTool 注销工具
+ * @param tool 
+ */
+export function unregisterTool(tool: Tool): void {
+    const index = registry.findIndex((t) => t.name === tool.name);
+    if (index === -1) throw new Error(`工具 ${tool.name} 未注册`);
+    registry.splice(index, 1);
+}
+
+/** 当前可见工具的名单；null 表示全部可见（没有技能激活时）。 */
+let visibleTools: string[] | null = null;
+
+/**
+ * 显式调用 setVisibleTools 设置可见工具
+ * @param tools 
+ */
+export function setVisibleTools(toolNames: string[] | null): void {
+    visibleTools = toolNames;
 }
 
 /** 工具注册表。新增工具调用 registerTool 收口，重复名字直接报错。 */
@@ -317,7 +338,10 @@ function truncate(text: string): string {
 
 /** 把内部 Tool 转成 OpenAI Chat Completions 的 tools 参数格式。 */
 export function toOpenAITools(): ChatCompletionTool[] {
-    return registry.map((tool) => ({
+    // 过滤可见工具
+    return registry
+    .filter((tool) => !visibleTools || visibleTools.includes(tool.name))
+    .map((tool) => ({
         type: 'function',
         function: {
             name: tool.name,

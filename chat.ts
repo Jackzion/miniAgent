@@ -34,9 +34,12 @@ export class Chat {
 
     /** 每次请求拿到用量就回调出去，供 TUI 面板累计显示。 */
     private onUsage?: (u: UsageInfo) => void;
+
     instructions: string;
 
-    constructor(baseURL: string, apiKey: string, model: string , instructions: string) {
+    private skillInstructions = '';
+
+    constructor(baseURL: string, apiKey: string, model: string, instructions: string) {
         this.client = new OpenAI({ baseURL, apiKey });
         this.model = model;
         this.instructions = instructions;
@@ -44,6 +47,20 @@ export class Chat {
 
     setUsageListener(fn: (u: UsageInfo) => void): void {
         this.onUsage = fn;
+    }
+
+    /** 挂上当前技能的指令，拼接进每次请求的 system prompt；传空串表示无技能。 */
+    setSkillInstructions(text: string): void {
+        this.skillInstructions = text;
+    }
+
+    /** 组装 system prompt：任务基石 + 项目指令 + 技能指令。 */
+    private systemPrompt(): string {
+        const skill = this.skillInstructions.trim();
+        return (
+            `${AGENT_SYSTEM}\n\n项目指令（AGENTS.md）：\n${this.instructions || '暂无'}` +
+            (skill ? `\n\n技能指令：\n${skill}` : '')
+        );
     }
 
     /** 携带 history 发送用户输入，逐段产出回复增量；结束后把完整回答写入 history。 */
@@ -75,7 +92,7 @@ export class Chat {
                 // 请求 ， 返回 Stream<OpenAI.Chat.Completions.ChatCompletionChunk>
                 const stream = await this.client.chat.completions.create({
                     model: this.model,
-                    messages: [{ role: 'system', content: `${AGENT_SYSTEM}\n\n项目指令（AGENTS.md）：\n${this.instructions || '暂无'}` }, ...this.history], // 每轮全量携带历史
+                    messages: [{ role: 'system', content: this.systemPrompt() }, ...this.history], // 每轮全量携带历史
                     stream: true,
                     tools: toOpenAITools(), // 开始请求时，告知本地 tools
                     // 若有 todo keyword 直接强制 apeend todo_write in tool_choice

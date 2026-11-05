@@ -130,3 +130,8 @@ export function redact(text: string): string {
     }
     return result;
 }
+
+// 确保工具策略为指定值 ， register tool policy to config
+export function ensureToolPolicy(toolName: string, policy: Policy) {
+    if (config.tools[toolName] === undefined) config.tools[toolName] = policy;
+}
