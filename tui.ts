@@ -8,16 +8,26 @@ import {
     matchesKey,
     ProcessTerminal,
     ScrollView,
+    setKeybindings,
     sliceByColumn,
     Text,
     TuiAltScreen,
     truncateToWidth,
     visibleWidth,
     VStack,
+    KeybindingsManager,
+    TUI_KEYBINDINGS,
     type Component,
     type Focusable,
 } from '@earendil-works/pi-tui';
 import { paint } from './color.js';
+
+// 默认 lineUp/lineDown 没有键位；补上 ↑/↓ 单行滚动（PageUp/PageDown、滚轮仍可用）。
+// 必须在任何 getKeybindings() 之前设置。
+setKeybindings(new KeybindingsManager(TUI_KEYBINDINGS, {
+    'tui.altScreen.lineUp': ['up'],
+    'tui.altScreen.lineDown': ['down'],
+}));
 
 /**
  * pi-tui 用法速览（本文件所有组件都围绕这几个概念）：
