@@ -10,6 +10,8 @@ import { visibleWidth } from '@earendil-works/pi-tui';
 import { basename, format } from 'path';
 import { undo } from './undo.js';
 import { formatTodos, setupPlanning } from './todo.js';
+import { listMemory, loadMemory, setupMemory } from './memory.js';
+import { loadIntroduction } from './instructions.js';
 
 /** 模型上下文窗口（tokens）：demo 直接写死，用于计算「上下文占用比例」。 */
 const CONTEXT_WINDOW = 64000;
@@ -32,7 +34,17 @@ try {
     process.exit(1);
 }
 
-const chat = new Chat(config.baseURL, config.apiKey, config.model);
+// 加载 memory and AGENT.MD
+let introduction = '';
+try {
+    await loadMemory();
+    introduction = await loadIntroduction(permissions.root);
+} catch (e) {
+    console.error(`项目上下文读取失败：${(e as Error).message}`);
+    process.exit(1);
+}
+
+const chat = new Chat(config.baseURL, config.apiKey, config.model, introduction);
 const sessions = new Sessions();
 
 /** 用量状态：live 是流式进行中按字符估算的增量；正式总数以接口 usage 为准。 */
@@ -46,6 +58,8 @@ const tui = new TUI(onLine, onExit);
 setupPlanning((task) => chat.delegate(task), updatePanel);
 // 把权限层 ask 的确认接到 TUI: 默认实现是「一律拒绝」，这里换成输入行上的 [y/N]
 setupPermissions(permissions, (prompt) => tui.confirm(prompt));
+// 初始化 memory tools
+setupMemory(() => tui.append('记忆已更新', 'sys'));
 
 
 chat.setUsageListener((u) => {
@@ -182,6 +196,11 @@ async function handleCommand(line: string): Promise<void> {
         case '/todos': {
             const todos = formatTodos();
             tui.append(todos.length > 0 ? `TODO：\n${todos.join('\n')}` : '（暂无 TODO）', 'sys');
+            break;
+        }
+        case '/memory': {
+            const memory = listMemory();
+            tui.append(memory.length > 0 ? `记忆：\n${memory.join('\n')}` : '（暂无记忆）', 'sys');
             break;
         }
         default:

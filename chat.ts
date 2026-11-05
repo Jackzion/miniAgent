@@ -20,7 +20,7 @@ const COMPRESS_SYSTEM = `你是对话压缩器。把用户贴出的历史对话�
 只输出压缩后的要点，不要解释、不要寒暄、不要保留逐字对话。`;
 
 /** agent prompt */
-const AGENT_SYSTEM = `你是一个本地编码 Agent。遇到需要多个步骤的任务时，先调用 todo_write 制定简短计划，再逐项执行并更新状态；用户明确要求 TODO 或任务清单时，必须先调用 todo_write。简单任务直接完成，不要为了形式创建 TODO。可把边界清楚的分析、设计或审查任务交给 delegate_task，多个子任务必须串行委派。`;
+const AGENT_SYSTEM = `你是一个本地编码 Agent。遇到需要多个步骤的任务时，先调用 todo_write 制定简短计划，再逐项执行并更新状态；用户明确要求 TODO 或任务清单时，必须先调用 todo_write。简单任务直接完成，不要为了形式创建 TODO。可把边界清楚的分析、设计或审查任务交给 delegate_task，多个子任务必须串行委派。用户偏好、项目事实或重要决定值得跨会话保留时，调用 memory_write；需要回忆这些信息时调用 memory_search，不要假设记忆内容。不要记录临时任务进度或可随时从文件读到的内容。`;
 
 
 /**
@@ -34,10 +34,12 @@ export class Chat {
 
     /** 每次请求拿到用量就回调出去，供 TUI 面板累计显示。 */
     private onUsage?: (u: UsageInfo) => void;
+    instructions: string;
 
-    constructor(baseURL: string, apiKey: string, model: string) {
+    constructor(baseURL: string, apiKey: string, model: string , instructions: string) {
         this.client = new OpenAI({ baseURL, apiKey });
         this.model = model;
+        this.instructions = instructions;
     }
 
     setUsageListener(fn: (u: UsageInfo) => void): void {
@@ -73,7 +75,7 @@ export class Chat {
                 // 请求 ， 返回 Stream<OpenAI.Chat.Completions.ChatCompletionChunk>
                 const stream = await this.client.chat.completions.create({
                     model: this.model,
-                    messages: [{ role: 'system', content: AGENT_SYSTEM }, ...this.history], // 每轮全量携带历史
+                    messages: [{ role: 'system', content: `${AGENT_SYSTEM}\n\n项目指令（AGENTS.md）：\n${this.instructions || '暂无'}` }, ...this.history], // 每轮全量携带历史
                     stream: true,
                     tools: toOpenAITools(), // 开始请求时，告知本地 tools
                     // 若有 todo keyword 直接强制 apeend todo_write in tool_choice
