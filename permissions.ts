@@ -23,6 +23,8 @@ const DEFAULT_TOOLS: Record<string, Policy> = {
     delegate_task: 'allow',
     memory_write: 'allow',
     memory_search: 'allow',
+    search: 'allow',
+    fetch: 'ask',
 };
 
 // default PermissionConfig

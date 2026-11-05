@@ -8,6 +8,8 @@ import { readdir, readFile, glob, mkdir, writeFile } from 'node:fs/promises';
 import { dirname } from "node:path";
 import { authorize, policyFor } from "./permissions.js";
 import { backup } from "./undo.js";
+import { searchTool } from './inner_tools/search.js';
+import { fetchTool } from './inner_tools/fetch.js';
 
 const execAsync = promisify(exec);
 
@@ -281,6 +283,8 @@ export const BUILTIN_TOOLS: Tool[] = [
 ];
 
 BUILTIN_TOOLS.forEach(registerTool);
+searchTool.forEach(registerTool);
+fetchTool.forEach(registerTool);
 
 /** 展示 diff 并确认后写盘；新文件也照常走此流程。内容没变则不打扰用户，直接返回成功。 */
 async function commitWrite(tool: 'write' | 'patch', file: string, next: string): Promise<boolean> {
@@ -331,7 +335,7 @@ function simpleDiff(oldText: string, newText: string): string {
 }
 
 /** 超出阈值就截断输出，并附上原长度提示。 */
-function truncate(text: string): string {
+export function truncate(text: string): string {
     if (text.length <= MAX_OUTPUT_CHARS) return text;
     return `${text.slice(0, MAX_OUTPUT_CHARS)}\n...(输出已截断，原共 ${text.length} 字符)`;
 }
